@@ -974,16 +974,23 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         removeInterfaceOrientationObserver()
 #endif
 
-        if let captureSession = captureSession {
-            captureSession.stopRunning()
-            for input in captureSession.inputs {
-                captureSession.removeInput(input)
-            }
-            for output in captureSession.outputs {
-                captureSession.removeOutput(output)
-            }
-
+        // OneApp patch: detach the session here so the plugin reads as stopped at once,
+        // then stop and release it on sessionQueue instead of the main thread. On iOS 27
+        // stopRunning() and the session's deallocation can wait on the camera service for
+        // seconds, which froze the UI (AppHang) until the watchdog killed the app. The
+        // closure holds the last strong reference, so the session is deallocated there too.
+        // sessionQueue is serial, so a restart's startRunning() queues behind this teardown.
+        if let session = captureSession {
             self.captureSession = nil
+            sessionQueue.async {
+                session.stopRunning()
+                for input in session.inputs {
+                    session.removeInput(input)
+                }
+                for output in session.outputs {
+                    session.removeOutput(output)
+                }
+            }
         }
 
         if let device = device {
