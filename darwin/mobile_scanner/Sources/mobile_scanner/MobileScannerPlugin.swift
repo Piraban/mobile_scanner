@@ -974,6 +974,10 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         removeInterfaceOrientationObserver()
 #endif
 
+        // TEMP FIX: workaround for a mobile_scanner bug
+        // (https://github.com/juliansteenbakker/mobile_scanner/issues/1870).
+        // Revert this change once mobile_scanner ships the fix.
+        //
         // OneApp patch: detach the session here so the plugin reads as stopped at once,
         // then stop and release it on sessionQueue instead of the main thread. On iOS 27
         // stopRunning() and the session's deallocation can wait on the camera service for
