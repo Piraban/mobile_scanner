@@ -500,8 +500,6 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
 #if os(iOS)
         device.addObserver(self, forKeyPath: #keyPath(AVCaptureDevice.videoZoomFactor), options: [.new, .initial], context: nil)
 #endif
-        captureSession!.beginConfiguration()
-        
         // Check the zoom factor at switching from ultra wide camera to wide camera.
         standardZoomFactor = 1
 #if os(iOS)
@@ -517,62 +515,50 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
         }
 #endif
 
-        // Add device input
-        do {
-            let input = try AVCaptureDeviceInput(device: device)
-            
-            if (!(captureSession!.canAddInput(input))) {
-                // Commit the open configuration before releasing the camera,
-                // because `stopRunning()` throws an `NSGenericException` inside it.
-                captureSession!.commitConfiguration()
-                failStart(result, FlutterError(
-                    code: MobileScannerErrorCodes.CAMERA_ERROR,
-                    message: MobileScannerErrorCodes.CAMERA_ERROR_CAPTURE_SESSION_INPUT_OCCUPIED_MESSAGE,
-                    details: nil))
-                return
-            }
-            
-            captureSession!.addInput(input)
-        } catch {
-            captureSession!.commitConfiguration()
-            failStart(result, FlutterError(
-                code: MobileScannerErrorCodes.CAMERA_ERROR,
-                message: error.localizedDescription, details: nil))
-            return
-        }
-        captureSession!.sessionPreset = AVCaptureSession.Preset.high
-
-        let videoOutput = AVCaptureVideoDataOutput()
-
-        let format = getPreferredVideoFormat(videoOutput: videoOutput)
-        videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: format]
-        videoOutput.alwaysDiscardsLateVideoFrames = true
-        videoOutput.setSampleBufferDelegate(self, queue: self.sampleBufferQueue)
-        captureSession!.addOutput(videoOutput)
+        // Read on the main thread: it asks UIKit for the interface orientation.
         let deviceVideoOrientation = self.getVideoOrientation()
-
-        if let connection = videoOutput.connections.first {
-            if connection.isVideoOrientationSupported {
-                connection.videoOrientation = deviceVideoOrientation
-            }
-
-            if position == .front && connection.isVideoMirroringSupported {
-                connection.isVideoMirrored = true
-            }
-        }
-
-        captureSession!.commitConfiguration()
 
 #if os(iOS)
         // Set up observer to update video orientation when interface orientation changes
         setupInterfaceOrientationObserver()
 #endif
 
+        // TEMP FIX: workaround for a mobile_scanner bug
+        // (https://github.com/juliansteenbakker/mobile_scanner/issues/1870).
+        // Revert this change once mobile_scanner ships the fix.
+        //
+        // OneApp patch: configure the session on sessionQueue, not the main thread.
+        // Creating the device input and committing the configuration wait on the system
+        // camera service, which on iOS 27 can take seconds, most of all right after another
+        // session was torn down (releaseCamera() queues that teardown on sessionQueue too).
+        // sessionQueue is serial, so this setup runs after any pending teardown and before
+        // the teardown of a stop() that arrives meanwhile. Only locals are used here:
+        // releaseCamera() may clear captureSession and device on the main thread at any time.
         let session = captureSession!
+        let camera: AVCaptureDevice = device
+        let cameraPosition = position
         sessionQueue.async {
-            session.startRunning()
+            let failure = self.configureSession(
+                session,
+                camera: camera,
+                position: cameraPosition,
+                videoOrientation: deviceVideoOrientation)
+
+            if failure == nil {
+                session.startRunning()
+            }
 
             DispatchQueue.main.async {
+                if let failure = failure {
+                    // A stop() meanwhile has already released this session.
+                    if self.captureSession === session {
+                        self.failStart(result, failure)
+                    } else {
+                        result(failure)
+                    }
+                    return
+                }
+
                 let dimensions: CMVideoDimensions
 
                 if let device = self.device {
@@ -628,6 +614,58 @@ public class MobileScannerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler,
                 result(answer)
             }
         }
+    }
+
+    /// OneApp patch (#1870): add the camera input and the video output to `session`.
+    /// Called on `sessionQueue`, so it touches only its arguments and the immutable
+    /// `sampleBufferQueue`. The configuration is always committed before returning,
+    /// because releasing a session with an open configuration throws inside `stopRunning()`.
+    ///
+    /// Returns the error to report, or `nil` when the session is ready to start.
+    private func configureSession(_ session: AVCaptureSession,
+                                  camera: AVCaptureDevice,
+                                  position: AVCaptureDevice.Position,
+                                  videoOrientation: AVCaptureVideoOrientation) -> FlutterError? {
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+
+        do {
+            let input = try AVCaptureDeviceInput(device: camera)
+
+            if (!session.canAddInput(input)) {
+                return FlutterError(
+                    code: MobileScannerErrorCodes.CAMERA_ERROR,
+                    message: MobileScannerErrorCodes.CAMERA_ERROR_CAPTURE_SESSION_INPUT_OCCUPIED_MESSAGE,
+                    details: nil)
+            }
+
+            session.addInput(input)
+        } catch {
+            return FlutterError(
+                code: MobileScannerErrorCodes.CAMERA_ERROR,
+                message: error.localizedDescription, details: nil)
+        }
+        session.sessionPreset = AVCaptureSession.Preset.high
+
+        let videoOutput = AVCaptureVideoDataOutput()
+
+        let format = getPreferredVideoFormat(videoOutput: videoOutput)
+        videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: format]
+        videoOutput.alwaysDiscardsLateVideoFrames = true
+        videoOutput.setSampleBufferDelegate(self, queue: self.sampleBufferQueue)
+        session.addOutput(videoOutput)
+
+        if let connection = videoOutput.connections.first {
+            if connection.isVideoOrientationSupported {
+                connection.videoOrientation = videoOrientation
+            }
+
+            if position == .front && connection.isVideoMirroringSupported {
+                connection.isVideoMirrored = true
+            }
+        }
+
+        return nil
     }
 
     /// Get the preferred video format for the given video output.

@@ -3,11 +3,11 @@
 Upstream: https://github.com/juliansteenbakker/mobile_scanner (pub.dev:
 https://pub.dev/packages/mobile_scanner).
 
-This branch is upstream tag `v7.5.0` plus one commit. OneApp pulls it as a git dependency
-(`dependency_overrides` in the app's `pubspec.yaml`, pinned to that commit). The only code
-change on top of the tag is in
-`darwin/mobile_scanner/Sources/mobile_scanner/MobileScannerPlugin.swift`, in
-`releaseCamera()`, marked `OneApp patch`.
+This branch is upstream tag `v7.5.0` plus the OneApp patch commits. OneApp pulls it as a git
+dependency (`dependency_overrides` in the app's `pubspec.yaml`, pinned to the branch tip). The
+only code changes on top of the tag are in
+`darwin/mobile_scanner/Sources/mobile_scanner/MobileScannerPlugin.swift`, in `releaseCamera()`
+and `start()` / `configureSession()`, marked `OneApp patch`.
 
 ## Why
 
@@ -28,6 +28,17 @@ seconds. Upstream 7.5.0 still does this, so upgrading alone does not fix it.
 `releaseCamera()` clears `captureSession` on the main thread right away (so the plugin
 reads as stopped and can be started again) and runs `stopRunning()`, the input/output
 removal and the final release of the session on the plugin's serial `sessionQueue`.
+
+`start()` builds the session configuration (`AVCaptureDeviceInput`, `addInput`, the video
+output, `commitConfiguration()`) in `configureSession()` on that same `sessionQueue`, followed
+by `startRunning()`. Creating the input and committing the configuration also wait on the
+camera service, most of all right after another session was torn down: the Stocktake
+Scan Location → Scan SKU hand-off and the camera coming back after the quantity sheet. Because
+the queue is serial, a start's setup runs after any pending teardown, and the teardown of a
+stop() that arrives meanwhile runs after it. The UIKit reads (interface orientation, the
+orientation observer) and the device observers stay on the main thread. A setup failure hops
+back to the main thread and releases the camera through `failStart`, unless a stop() already
+released that session.
 
 What the earlier 7.2.0 patch also carried is now upstream in 7.5.0 and was dropped:
 
